@@ -1,0 +1,214 @@
+name: Delivery Swing Finder
+
+on:
+  # ── Auto trigger: Mon–Fri at 10:45 AM UTC = 4:15 PM IST ──
+  schedule:
+    - cron: '45 10 * * 1-5'
+
+  # ── Manual trigger from GitHub UI anytime ──
+  workflow_dispatch:
+    inputs:
+      index:
+        description: 'NSE Index'
+        required: false
+        default: 'Nifty 50'
+      top:
+        description: 'Top N stocks'
+        required: false
+        default: '15'
+
+jobs:
+  run-analysis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+
+    # ── 1. Checkout your repo ──────────────────────────────────────────
+    - name: Checkout repo
+      uses: actions/checkout@v4
+
+    # ── 2. Python setup ───────────────────────────────────────────────
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    # ── 3. Install dependencies ───────────────────────────────────────
+    - name: Install Python packages
+      run: |
+        pip install playwright yfinance pandas tabulate colorama schedule
+
+    # ── 4. Install Playwright Chromium ────────────────────────────────
+    - name: Install Playwright Chromium
+      run: |
+        playwright install chromium
+        playwright install-deps chromium
+
+    # ── 5. Run the script ─────────────────────────────────────────────
+    - name: Run Delivery Swing Finder
+      env:
+        PYTHONUNBUFFERED: "1"
+      run: |
+        INDEX="${{ github.event.inputs.index || 'Nifty 50' }}"
+        TOP="${{ github.event.inputs.top || '15' }}"
+        python delivery_swing_finder.py \
+          --index "$INDEX" \
+          --top "$TOP" \
+          --csv "results/swings_$(date +'%Y%m%d_%H%M').csv"
+
+    # ── 6. Upload CSV as artifact (downloadable from GitHub) ──────────
+    - name: Upload results CSV
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: swing-results-${{ github.run_number }}
+        path: results/*.csv
+        retention-days: 30
+
+    # ── 7. Send Telegram notification ─────────────────────────────────
+    - name: Send Telegram notification
+      if: always()
+      env:
+        BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+      run: |
+        python - <<'PYEOF'
+        import os, glob, csv, requests
+
+        bot_token = os.environ.get("BOT_TOKEN", "")
+        chat_id   = os.environ.get("CHAT_ID", "")
+        if not bot_token or not chat_id:
+            print("Telegram secrets not set — skipping notification")
+            exit(0)
+
+        # Read latest CSV
+        files = sorted(glob.glob("results/*.csv"))
+        if not files:
+            msg = "⚠️ Delivery Swing Finder ran but no CSV produced."
+        else:
+            latest = files[-1]
+            rows = []
+            with open(latest, newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    rows.append(row)
+
+            # Filter BUY signals
+            buys = [r for r in rows if "BUY" in r.get("signal", "")]
+            date_str = os.path.basename(latest).replace("swings_","").replace(".csv","")
+
+            msg  = f"📊 *Delivery Swing Finder* — {date_str}\n"
+            msg += f"Total stocks scanned: {len(rows)}\n\n"
+
+            if buys:
+                msg += f"🎯 *{len(buys)} BUY Signals:*\n"
+                for b in buys[:8]:
+                    name   = b.get("name", "")[:20]
+                    ltp    = b.get("ltp", "")
+                    score  = b.get("final_score", b.get("del_score",""))
+                    signal = b.get("signal", "")
+                    msg += f"  `{name:<20}` LTP={ltp}  Score={score}  {signal}\n"
+                if len(buys) > 8:
+                    msg += f"  _...and {len(buys)-8} more. Download CSV for full list._\n"
+            else:
+                msg += "No strong BUY signals today.\n"
+
+            msg += f"\n📁 Download CSV from GitHub Actions artifacts."
+
+        url  = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        data = {"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}
+        r = requests.post(url, data=data, timeout=10)
+        print("Telegram:", r.status_code, r.text[:100])
+        PYEOF
+
+    # ── 8. Send Email notification (optional) ─────────────────────────
+    - name: Send Email notification
+      if: always()
+      env:
+        GMAIL_USER: ${{ secrets.GMAIL_USER }}
+        GMAIL_PASS: ${{ secrets.GMAIL_APP_PASSWORD }}
+        TO_EMAIL:   ${{ secrets.NOTIFY_EMAIL }}
+      run: |
+        python - <<'PYEOF'
+        import os, glob, csv, smtplib
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+        from email.mime.base import MIMEBase
+        from email import encoders
+
+        user = os.environ.get("GMAIL_USER","")
+        pwd  = os.environ.get("GMAIL_PASS","")
+        to   = os.environ.get("TO_EMAIL","")
+        if not all([user, pwd, to]):
+            print("Email secrets not set — skipping")
+            exit(0)
+
+        files = sorted(glob.glob("results/*.csv"))
+        if not files:
+            print("No CSV to email")
+            exit(0)
+
+        latest = files[-1]
+        rows = []
+        with open(latest, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                rows.append(row)
+
+        buys = [r for r in rows if "BUY" in r.get("signal","")]
+
+        # HTML table
+        table_rows = ""
+        for b in buys[:15]:
+            signal = b.get("signal","")
+            color  = "#00c853" if "STRONG" in signal else "#69f0ae"
+            table_rows += f"""
+            <tr>
+              <td>{b.get('name','')}</td>
+              <td>{b.get('ltp','')}</td>
+              <td>{b.get('change_pct','')}%</td>
+              <td>{b.get('daily_del%','')}%</td>
+              <td>{b.get('weekly_del%','')}%</td>
+              <td>{b.get('monthly_del%','')}%</td>
+              <td>{b.get('del_score','')}</td>
+              <td>{b.get('rsi14','')}</td>
+              <td>{b.get('final_score','')}</td>
+              <td style='color:{color};font-weight:bold'>{signal}</td>
+            </tr>"""
+
+        html = f"""
+        <html><body style='font-family:monospace;background:#111;color:#eee;padding:20px'>
+        <h2 style='color:#00e5ff'>📊 Delivery Swing Finder</h2>
+        <p>Scanned {len(rows)} stocks | {len(buys)} BUY signals found</p>
+        <table border='1' cellpadding='6' style='border-collapse:collapse;width:100%'>
+          <tr style='background:#1e1e1e;color:#00e5ff'>
+            <th>Name</th><th>LTP</th><th>Chg%</th>
+            <th>D-Del%</th><th>W-Del%</th><th>M-Del%</th>
+            <th>DelScore</th><th>RSI</th><th>FinalScore</th><th>Signal</th>
+          </tr>
+          {table_rows}
+        </table>
+        <p style='color:#aaa;font-size:12px'>Full CSV attached. Auto-generated by GitHub Actions.</p>
+        </body></html>"""
+
+        msg = MIMEMultipart()
+        msg["From"]    = user
+        msg["To"]      = to
+        msg["Subject"] = f"📊 Delivery Swings — {os.path.basename(latest)}"
+        msg.attach(MIMEText(html, "html"))
+
+        # Attach CSV
+        with open(latest, "rb") as f:
+            part = MIMEBase("application","octet-stream")
+            part.set_payload(f.read())
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(latest)}")
+            msg.attach(part)
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(user, pwd)
+            server.sendmail(user, to, msg.as_string())
+        print("Email sent to", to)
+        PYEOF
