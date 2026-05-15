@@ -106,7 +106,7 @@ jobs:
             msg += "\n📁 Download CSV from GitHub Actions artifacts."
 
         url  = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        data = {"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}
+        data = {"chat_id": chat_id, "text": msg}
         r = requests.post(url, data=data, timeout=10)
         print("Telegram:", r.status_code, r.text[:100])
         PYEOF
