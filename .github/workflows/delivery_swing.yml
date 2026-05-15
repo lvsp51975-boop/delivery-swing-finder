@@ -38,7 +38,7 @@ jobs:
     # ── 3. Install dependencies ───────────────────────────────────────
     - name: Install Python packages
       run: |
-        pip install playwright yfinance pandas tabulate colorama schedule
+        pip install playwright yfinance pandas tabulate colorama schedule requests
 
     # ── 4. Install Playwright Chromium ────────────────────────────────
     - name: Install Playwright Chromium
